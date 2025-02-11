@@ -1,35 +1,35 @@
 import os
 import tempfile
 import streamlit as st
+from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_together import Together
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-import pinecone
 
-# Initialize Pinecone
-def init_pinecone(api_key, index_name):
-    pinecone.init(api_key=api_key)
-    
-    if index_name not in pinecone.list_indexes():
-        pinecone.create_index(
-            name=index_name,
-            dimension=1536,  # Match OpenAI embedding size
-            metric="cosine",
-            spec=pinecone.ServerlessSpec(
-                cloud="aws",
-                region="us-west-2"
-            )
-        )
-    return pinecone.Index(index_name)
+# Initialize Pinecone connection
+pc = Pinecone(api_key=st.secrets.PINECONE_API_KEY)
+INDEX_NAME = "ragreader"
 
-# Process uploaded documents
-def process_documents(uploaded_files, openai_key, pinecone_key, index_name):
+# Validate index configuration
+index_info = pc.describe_index(INDEX_NAME)
+assert index_info.dimension == 1024, "Index dimension mismatch (expected 1024)"
+assert index_info.metric == "cosine", "Index metric mismatch (expected cosine)"
+
+# Initialize embeddings with explicit dimension setting
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=st.secrets.OPENAI_API_KEY,
+    dimensions=1024  # Must match index dimension
+)
+
+# Document processing pipeline
+def process_documents(uploaded_files):
     docs = []
     
-    # Load PDF files
+    # Process PDF files
     for file in uploaded_files:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(file.getvalue())
@@ -44,26 +44,27 @@ def process_documents(uploaded_files, openai_key, pinecone_key, index_name):
     )
     split_docs = text_splitter.split_documents(docs)
     
-    # Create embeddings and store in Pinecone
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=openai_key
-    )
-    
-    return PineconeVectorStore.from_documents(
+    # Store in Pinecone
+    PineconeVectorStore.from_documents(
         documents=split_docs,
         embedding=embeddings,
-        index_name=index_name,
-        pinecone_api_key=pinecone_key
+        index_name=INDEX_NAME,
+        pinecone_client=pc
     )
 
-# Initialize the QA chain
-def init_qa_chain(vector_store, together_key):
+# Initialize QA chain
+def init_qa_chain():
     llm = Together(
         model="togethercomputer/llama-3-70b-chat",
         temperature=0.3,
         max_tokens=1024,
-        together_api_key=together_key
+        together_api_key=st.secrets.TOGETHER_API_KEY
+    )
+    
+    vector_store = PineconeVectorStore(
+        index_name=INDEX_NAME,
+        embedding=embeddings,
+        pinecone_client=pc
     )
     
     return RetrievalQAWithSourcesChain.from_chain_type(
@@ -76,48 +77,29 @@ def init_qa_chain(vector_store, together_key):
 # Streamlit UI
 st.set_page_config(page_title="RAG Chat", layout="wide")
 
-# Sidebar configuration
+# Document management sidebar
 with st.sidebar:
-    st.header("Configuration")
-    pinecone_key = st.text_input("Pinecone API Key", type="password")
-    openai_key = st.text_input("OpenAI API Key", type="password")
-    together_key = st.text_input("Together AI API Key", type="password")
+    st.header("Document Upload")
     uploaded_files = st.file_uploader(
         "Upload PDF documents",
         type=["pdf"],
         accept_multiple_files=True
     )
     
-    index_name = st.text_input("Pinecone Index Name", "rag-chat")
-    
-    if st.button("Initialize System"):
-        if not all([pinecone_key, openai_key, together_key, uploaded_files]):
-            st.error("Please provide all required credentials and documents")
-        else:
-            with st.spinner("Initializing..."):
-                # Initialize Pinecone
-                init_pinecone(pinecone_key, index_name)
-                
-                # Process documents
-                vector_store = process_documents(
-                    uploaded_files,
-                    openai_key,
-                    pinecone_key,
-                    index_name
-                )
-                
-                # Create QA chain
-                st.session_state.qa_chain = init_qa_chain(vector_store, together_key)
-                st.success("System ready!")
+    if st.button("Process Documents") and uploaded_files:
+        with st.spinner("Storing documents..."):
+            process_documents(uploaded_files)
+            st.session_state.qa_chain = init_qa_chain()
+            st.success("Documents processed!")
 
 # Chat interface
-st.title("🧠 Document Chat Assistant")
-st.caption("Powered by Pinecone, Together AI, and LangChain")
+st.title("📚 Document Chat Assistant")
+st.caption(f"Connected to Pinecone index: {INDEX_NAME} (1024-dim cosine)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat messages
+# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -125,23 +107,25 @@ for msg in st.session_state.messages:
 # Handle user input
 if prompt := st.chat_input("Ask about your documents"):
     if "qa_chain" not in st.session_state:
-        st.error("Please initialize the system first in the sidebar")
+        st.error("Please upload and process documents first")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing documents..."):
+            with st.spinner("Searching documents..."):
                 response = st.session_state.qa_chain.invoke(
                     {"question": prompt},
                     return_only_outputs=True
                 )
                 
                 st.markdown(f"**Answer**: {response['answer']}")
-                st.markdown("**Sources**:")
+                st.markdown("**Relevant Sources**:")
                 for doc in response['source_documents'][:3]:
-                    st.markdown(f"- `{doc.metadata['source']}` (Page {doc.metadata.get('page', 'N/A')})")
+                    source = os.path.basename(doc.metadata['source'])
+                    page = doc.metadata.get('page', 'N/A')
+                    st.markdown(f"- `{source}` (Page {page})")
         
         st.session_state.messages.append({
             "role": "assistant",
